@@ -1,0 +1,61 @@
+tickers:
+  - symbol: MSFT
+    name: Microsoft
+    bucket: Tech Core
+    thesis: Diversified across AI, Cloud, and Gaming.
+
+  - symbol: NVDA
+    name: NVIDIA
+    bucket: AI Growth
+    thesis: The infrastructure for the next decade.
+
+  - symbol: GOOGL
+    name: Alphabet
+    bucket: Advertising/AI
+    thesis: Dominant search and video (YouTube) data.
+
+  - symbol: AMZN
+    name: Amazon
+    bucket: E-commerce/Cloud
+    thesis: Massive logistics and AWS cash flow.
+
+  - symbol: TSM
+    name: TSMC
+    bucket: Manufacturing
+    thesis: The literal factory for all modern tech.
+
+  - symbol: LLY
+    name: Eli Lilly
+    bucket: Healthcare
+    thesis: Massive lead in the weight-loss drug market.
+
+  - symbol: ASML
+    name: ASML
+    bucket: Semi-Equipment
+    thesis: Monopoly on the machines that make chips.
+
+  - symbol: COST
+    name: Costco
+    bucket: Consumer Staple
+    thesis: Recession-proof loyalty and bulk retail.
+
+  - symbol: NEE
+    name: NextEra Energy
+    bucket: Energy Core
+    thesis: Regulated utility with a massive renewable lead.
+
+  - symbol: V
+    name: Visa
+    bucket: Financial Core
+    thesis: A global toll booth on spending.
+
+  - symbol: SPY
+    name: SPDR S&P 500 ETF
+    bucket: Market Regime
+    thesis: Broad US market filter.
+
+settings:
+  timezone: Asia/Singapore
+  alerts:
+    telegram: true
+    email: false

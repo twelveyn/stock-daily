@@ -1,0 +1,334 @@
+import os
+import math
+import yaml
+import sqlite3
+import requests
+import pandas as pd
+import yfinance as yf
+
+from ta.trend import MACD, SMAIndicator
+from ta.momentum import RSIIndicator
+
+
+DB_FILE = "history.db"
+WATCHLIST_FILE = "watchlist.yaml"
+
+
+def load_watchlist(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            symbol TEXT NOT NULL,
+            signal TEXT NOT NULL,
+            score INTEGER NOT NULL,
+            run_date TEXT NOT NULL DEFAULT (date('now')),
+            PRIMARY KEY(symbol, run_date)
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def save_signal(conn, symbol: str, signal: str, score: int):
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO signals(symbol, signal, score, run_date)
+        VALUES (?, ?, ?, date('now'))
+    """, (symbol, signal, score))
+    conn.commit()
+
+
+def get_previous_signal(conn, symbol: str):
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT signal, score, run_date
+        FROM signals
+        WHERE symbol = ?
+        ORDER BY run_date DESC
+        LIMIT 1 OFFSET 1
+    """, (symbol,))
+    row = cur.fetchone()
+    return row if row else None
+
+
+def fetch_data(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
+    df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [col[0] for col in df.columns]
+
+    df = df.rename(columns=str.title)
+    return df
+
+
+def nearest_support_resistance(df: pd.DataFrame, lookback: int = 30):
+    recent = df.tail(lookback)
+    support = float(recent["Low"].min())
+    resistance = float(recent["High"].max())
+    return support, resistance
+
+
+def safe_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return float("nan")
+
+
+def analyze_symbol(symbol: str):
+    df = fetch_data(symbol)
+    if df.empty or len(df) < 60:
+        return {
+            "symbol": symbol,
+            "error": "Not enough data"
+        }
+
+    close = df["Close"]
+    volume = df["Volume"]
+
+    df["SMA20"] = SMAIndicator(close, window=20).sma_indicator()
+    df["SMA50"] = SMAIndicator(close, window=50).sma_indicator()
+    df["SMA200"] = close.rolling(200).mean()
+    df["RSI"] = RSIIndicator(close, window=14).rsi()
+
+    macd_obj = MACD(close)
+    df["MACD"] = macd_obj.macd()
+    df["MACD_SIGNAL"] = macd_obj.macd_signal()
+    df["VOL20"] = volume.rolling(20).mean()
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    price = safe_float(last["Close"])
+    sma20 = safe_float(last["SMA20"])
+    sma50 = safe_float(last["SMA50"])
+    sma200 = safe_float(last["SMA200"])
+    rsi = safe_float(last["RSI"])
+    macd = safe_float(last["MACD"])
+    macd_signal = safe_float(last["MACD_SIGNAL"])
+    avg_vol = safe_float(last["VOL20"])
+    today_vol = safe_float(last["Volume"])
+
+    support, resistance = nearest_support_resistance(df)
+
+    score = 50
+    reasons = []
+    risks = []
+
+    if price > sma20:
+        score += 8
+        reasons.append("Above 20 MA")
+    else:
+        score -= 8
+        risks.append("Below 20 MA")
+
+    if price > sma50:
+        score += 12
+        reasons.append("Above 50 MA")
+    else:
+        score -= 12
+        risks.append("Below 50 MA")
+
+    if not math.isnan(sma200):
+        if price > sma200:
+            score += 15
+            reasons.append("Above 200 MA")
+        else:
+            score -= 15
+            risks.append("Below 200 MA")
+
+    if 50 <= rsi <= 68:
+        score += 10
+        reasons.append(f"RSI healthy at {rsi:.1f}")
+    elif rsi > 75:
+        score -= 8
+        risks.append(f"RSI overbought at {rsi:.1f}")
+    elif rsi < 35:
+        score -= 6
+        risks.append(f"RSI weak at {rsi:.1f}")
+
+    if macd > macd_signal:
+        score += 12
+        reasons.append("MACD bullish")
+    else:
+        score -= 12
+        risks.append("MACD bearish")
+
+    if avg_vol > 0 and today_vol > 1.5 * avg_vol:
+        score += 6
+        reasons.append("Volume spike")
+
+    gap_pct = ((last["Open"] - prev["Close"]) / prev["Close"]) * 100
+    if gap_pct >= 2:
+        reasons.append(f"Gap up {gap_pct:.1f}%")
+        score += 3
+    elif gap_pct <= -2:
+        risks.append(f"Gap down {gap_pct:.1f}%")
+        score -= 3
+
+    distance_to_support = ((price - support) / price) * 100 if price else 0
+    distance_to_resistance = ((resistance - price) / price) * 100 if price else 0
+
+    if distance_to_support < 2:
+        risks.append("Very near support break risk")
+    if distance_to_resistance < 2:
+        risks.append("Near resistance")
+
+    score = max(0, min(100, int(round(score))))
+
+    if score >= 70:
+        signal = "Bullish"
+    elif score >= 40:
+        signal = "Neutral"
+    else:
+        signal = "Bearish"
+
+    return {
+        "symbol": symbol,
+        "price": round(price, 2),
+        "signal": signal,
+        "score": score,
+        "rsi": round(rsi, 1),
+        "support": round(support, 2),
+        "resistance": round(resistance, 2),
+        "reasons": reasons,
+        "risks": risks,
+    }
+
+
+def derive_market_regime(spy_result: dict):
+    if "error" in spy_result:
+        return {"label": "Unknown", "penalty": 0, "summary": "SPY data unavailable."}
+
+    score = spy_result["score"]
+    if score >= 70:
+        return {
+            "label": "Risk-on",
+            "penalty": 0,
+            "summary": f"SPY is strong at {score}/100. Bullish setups get full credit."
+        }
+    if score >= 40:
+        return {
+            "label": "Cautious",
+            "penalty": 5,
+            "summary": f"SPY is mixed at {score}/100. Bullish setups are scored more strictly."
+        }
+    return {
+        "label": "Risk-off",
+        "penalty": 12,
+        "summary": f"SPY is weak at {score}/100. Bullish setups are penalized harder."
+    }
+
+
+def apply_regime(result: dict, regime: dict):
+    if result["symbol"] == "SPY" or "error" in result:
+        return result
+
+    adjusted = dict(result)
+    penalty = regime["penalty"]
+    if penalty > 0:
+        adjusted["score"] = max(0, adjusted["score"] - penalty)
+
+        if adjusted["score"] >= 70:
+            adjusted["signal"] = "Bullish"
+        elif adjusted["score"] >= 40:
+            adjusted["signal"] = "Neutral"
+        else:
+            adjusted["signal"] = "Bearish"
+
+        adjusted["reasons"] = adjusted["reasons"] + [f"Regime adjustment: -{penalty} due to {regime['label']} market"]
+    return adjusted
+
+
+def format_result(entry: dict, result: dict, changed_text: str = "") -> str:
+    if "error" in result:
+        return f"{entry['symbol']} — Error: {result['error']}"
+
+    lines = [
+        f"{entry['symbol']} — {result['signal']} ({result['score']}/100)",
+        f"{entry.get('name', '')}",
+        f"Bucket: {entry.get('bucket', '-')}",
+        f"Thesis: {entry.get('thesis', '-')}",
+        f"Price: {result['price']}",
+        f"RSI: {result['rsi']}",
+        f"Support: {result['support']}",
+        f"Resistance: {result['resistance']}",
+        f"Reasons: {', '.join(result['reasons']) if result['reasons'] else '-'}",
+        f"Risks: {', '.join(result['risks']) if result['risks'] else '-'}",
+    ]
+    if changed_text:
+        lines.append(changed_text)
+    return "\n".join(lines)
+
+
+def send_telegram(message: str):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+    if not token or not chat_id:
+        print("Telegram secrets missing. Skipping Telegram send.")
+        return
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": message[:4000],
+    }
+    response = requests.post(url, json=payload, timeout=20)
+    response.raise_for_status()
+
+
+def main():
+    watchlist = load_watchlist(WATCHLIST_FILE)
+    entries = watchlist["tickers"]
+
+    conn = init_db()
+
+    raw_results = []
+    for entry in entries:
+        symbol = entry["symbol"]
+        raw_results.append((entry, analyze_symbol(symbol)))
+
+    spy_raw = next((res for entry, res in raw_results if entry["symbol"] == "SPY"), None)
+    regime = derive_market_regime(spy_raw if spy_raw else {"error": "Missing SPY"})
+
+    final_results = []
+    for entry, res in raw_results:
+        adjusted = apply_regime(res, regime)
+        final_results.append((entry, adjusted))
+
+    header = [
+        "Daily Watchlist Scan",
+        f"Market regime: {regime['label']}",
+        regime["summary"],
+        ""
+    ]
+
+    body = []
+    for entry, res in final_results:
+        changed_text = ""
+        if "error" not in res:
+            save_signal(conn, entry["symbol"], res["signal"], res["score"])
+            prev = get_previous_signal(conn, entry["symbol"])
+            if prev:
+                prev_signal, prev_score, prev_date = prev
+                if prev_signal != res["signal"]:
+                    changed_text = f"Signal changed: {prev_signal} ({prev_score}) -> {res['signal']} ({res['score']})"
+        body.append(format_result(entry, res, changed_text))
+        body.append("\n" + "-" * 40 + "\n")
+
+    message = "\n".join(header + body)
+    print(message)
+    send_telegram(message)
+
+
+if __name__ == "__main__":
+    main()
